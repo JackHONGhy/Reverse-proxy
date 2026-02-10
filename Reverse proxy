@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+
+#
+# Ubuntu 24.04 Nginx 高性能反向代理一键部署脚本 (终极优化版)
+#
+# 改进点:
+#   - 支持 Nginx 1.25+ 的 http2 独立指令
+#   - 增加 proxy_ssl_server_name 支持，解决源站 SNI 握手问题
+#   - 自动处理缓存目录权限 (www-data)
+#   - 独立日志文件路径，方便分析
+#
+# Author: Gemini & You
+#
+
+set -eo pipefail
+
+# --- 配置 ---
+PROXY_DOMAIN="ez.usux.cn"
+ORIGIN_DOMAIN="origin.usux.org"
+EMAIL="hhy011214@gmail.com"
+# --- 配置结束 ---
+
+NGINX_CONF_FILE="/etc/nginx/sites-available/$PROXY_DOMAIN.conf"
+CACHE_DIR="/var/cache/nginx/$PROXY_DOMAIN"
+LOG_DIR="/var/log/nginx/$PROXY_DOMAIN"
+CACHE_ZONE_NAME="${PROXY_DOMAIN//./_}_cache"
+
+main() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "❌ 错误：请使用 sudo 运行此脚本。"
+        exit 1
+    fi
+
+    clear
+    echo "⚡️ 正在部署 Ubuntu 24.04 Nginx 终极优化版反向代理..."
+    echo "--------------------------------------------------------"
+    echo "域名: $PROXY_DOMAIN  ->  源站: $ORIGIN_DOMAIN"
+    echo "--------------------------------------------------------"
+
+    prepare_env
+    install_dependencies
+    request_ssl_certificate
+    create_nginx_config
+    apply_firewall_rules
+    final_summary
+}
+
+# 准备环境：目录与权限
+prepare_env() {
+    echo "--> 准备环境: 创建缓存与日志目录..."
+    mkdir -p "$CACHE_DIR"
+    mkdir -p "$LOG_DIR"
+    # 确保 Nginx 进程有权读写缓存
+    chown -R www-data:www-data "$CACHE_DIR"
+    chown -R www-data:www-data "$LOG_DIR"
+}
+
+install_dependencies() {
+    echo "--> 步骤 1: 安装必要组件..."
+    apt-get update > /dev/null
+    apt-get install -y nginx python3-certbot-nginx
+}
+
+request_ssl_certificate() {
+    echo "--> 步骤 2: 零停机 SSL 证书申请..."
+    
+    # 临时虚拟主机配置
+    if [ ! -f "$NGINX_CONF_FILE" ]; then
+        cat > "$NGINX_CONF_FILE" <<EOF
+server {
+    listen 80;
+    server_name ${PROXY_DOMAIN};
+    root /var/www/html;
+}
+EOF
+        ln -s -f "$NGINX_CONF_FILE" "/etc/nginx/sites-enabled/"
+    fi
+
+    systemctl reload nginx || systemctl start nginx
+
+    certbot --nginx --agree-tos --non-interactive --keep-until-expiring \
+        --no-eff-email --email "$EMAIL" -d "$PROXY_DOMAIN" --redirect
+
+    if [ $? -ne 0 ]; then
+        echo "❌ 错误：证书申请失败，请检查域名解析和 80 端口是否开放。"
+        exit 1
+    fi
+}
+
+create_nginx_config() {
+    echo "--> 步骤 3: 生成高性能 Nginx 配置文件..."
+
+    cat > "$NGINX_CONF_FILE" <<EOF
+# 缓存区域定义
+proxy_cache_path ${CACHE_DIR} levels=1:2 keys_zone=${CACHE_ZONE_NAME}:10m max_size=2g inactive=60m use_temp_path=off;
+
+server {
+    listen 80;
+    server_name ${PROXY_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    # Ubuntu 24.04 (Nginx 1.25+) 推荐的新语法
+    http2 on; 
+    server_name ${PROXY_DOMAIN};
+
+    # 日志配置
+    access_log ${LOG_DIR}/access.log;
+    error_log  ${LOG_DIR}/error.log warn;
+
+    # SSL 证书
+    ssl_certificate /etc/letsencrypt/live/${PROXY_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PROXY_DOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # SSL 优化
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+    resolver 8.8.8.8 1.1.1.1 valid=300s;
+    resolver_timeout 5s;
+
+    # 压缩配置
+    gzip on;
+    gzip_comp_level 5;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+    location / {
+        # --- 反向代理核心 ---
+        proxy_pass https://${ORIGIN_DOMAIN};
+        
+        # --- SNI 修复：极其重要 ---
+        # 强制 Nginx 在与源站握手时发送正确的域名，防止源站 403/502
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${ORIGIN_DOMAIN};
+        proxy_ssl_session_reuse on;
+
+        # Header 转发
+        proxy_set_header Host ${ORIGIN_DOMAIN}; # 部分源站需要 Host 为源站域名
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # WebSocket 支持
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # 缓存逻辑
+        proxy_cache ${CACHE_ZONE_NAME};
+        proxy_cache_valid 200 302 30m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_lock on;
+        
+        # 调试头：查看缓存是否命中 (HIT/MISS/BYPASS)
+        add_header X-Cache-Status \$upstream_cache_status;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+    }
+}
+EOF
+
+    nginx -t && systemctl reload nginx
+    echo "✅ 配置文件已更新并生效。"
+}
+
+apply_firewall_rules() {
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+        echo "--> 步骤 4: 更新防火墙规则..."
+        ufw allow 'Nginx Full'
+    fi
+}
+
+final_summary() {
+    echo ""
+    echo "--------------------------------------------------------"
+    echo "🎉 部署完成！"
+    echo "站点地址: https://${PROXY_DOMAIN}"
+    echo "日志目录: ${LOG_DIR}"
+    echo "缓存状态: 可通过浏览器 F12 查看 X-Cache-Status 响应头"
+    echo "--------------------------------------------------------"
+}
+
+main
