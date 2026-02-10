@@ -20,12 +20,12 @@ get_user_input() {
     
     # 获取反代域名
     while [[ -z "$PROXY_DOMAIN" ]]; do
-        read -p "1. 请输入【反代域名】 (如: ez.usux.cn): " PROXY_DOMAIN < /dev/tty
+        read -p "1. 请输入【反代域名】 (如: xxx.xxx.xxx): " PROXY_DOMAIN < /dev/tty
     done
 
     # 获取源站域名
     while [[ -z "$ORIGIN_DOMAIN" ]]; do
-        read -p "2. 请输入【源站域名】 (如: origin.usux.org): " ORIGIN_DOMAIN < /dev/tty
+        read -p "2. 请输入【源站域名】 (如: xxx.xxx.xxx): " ORIGIN_DOMAIN < /dev/tty
     done
 
     # 获取邮箱
